@@ -1,22 +1,20 @@
 package qoi
 
-/*
-
-QOI - The “Quite OK Image” format for fast, lossless image compression
-
-Original version by Dominic Szablewski - https://phoboslab.org
-Go version by Xavier-Frédéric Moulet
-
-*/
-
 import (
 	"bufio"
 	"encoding/binary"
 	"errors"
-	"image"
-	"image/color"
+	"fmt"
 	"io"
 )
+
+type Header struct {
+	magic      [4]byte
+	width      uint32
+	height     uint32
+	channels   uint8
+	colorspace uint8
+}
 
 const (
 	qoi_INDEX byte = 0b00_000000
@@ -29,6 +27,8 @@ const (
 	qoi_MASK_2 byte = 0b11_000000
 )
 
+var qoiEnd = []byte{0, 0, 0, 0, 0, 0, 0, 0b00000001}
+
 const qoiMagic = "qoif"
 
 const qoiPixelsMax = 400_000_000 // 400 million pixels ought to be enough for anybody
@@ -39,48 +39,58 @@ func qoi_COLOR_HASH(r, g, b, a byte) byte {
 
 type pixel [4]byte
 
-func Decode(r io.Reader) (image.Image, error) {
-	cfg, err := DecodeConfig(r)
+// Decode decodes QOI image data from r into dest, until all pixels are written.
+// When a non-nil error is returned, bytesWritten will be equal to:
+//   width*height*3 if includesAlpha == false
+//   width*height*4 if includesAlpha == true
+// If dest cannot fit the image, an error is returned.
+//
+// QOI provides no information on whether the read color data is alpha-premultiplied. This information needs to be known by the caller.
+func Decode(reader io.Reader, dest []byte) (bytesWritten int, width uint32, height uint32, includesAlpha bool, err error) {
+	header, err := DecodeHeader(reader)
 	if err != nil {
-		return nil, err
+		return 0, 0, 0, false, fmt.Errorf("could not decode header: %w", err)
 	}
-	NBPixels := cfg.Width * cfg.Height
-	if NBPixels == 0 || NBPixels > qoiPixelsMax {
-		return nil, errors.New("bad image dimensions")
+	numPixels := header.width * header.height
+	if numPixels == 0 {
+		return 0, 0, 0, false, nil
+	}
+	bytesPerPixel := header.channels
+	if numPixels > uint32(len(dest))/uint32(bytesPerPixel) {
+		return 0, 0, 0, false, fmt.Errorf("dest of size %d bytes cannot fit image data totalling %d bytes", len(dest), numPixels*uint32(bytesPerPixel))
 	}
 
-	b := bufio.NewReader(r)
-
-	img := image.NewNRGBA(image.Rect(0, 0, cfg.Width, cfg.Height))
+	b := bufio.NewReaderSize(reader, 250) // we make lots of small reads, so the cost of wrapping reader with a small buffered reader is worth it; don't use a big buffer though, since allocating memory is SLOW.
+	var b1, b2 byte
 
 	var index [64]pixel
 
 	run := 0
+	numDecodedPixels := uint32(0)
 
-	pixels := img.Pix // pixels yet to write
 	px := pixel{0, 0, 0, 255}
-	for len(pixels) > 0 {
+	for numDecodedPixels < numPixels {
 		if run > 0 {
 			run--
 		} else {
-			b1, err := b.ReadByte()
+			b1, err = b.ReadByte()
 			if err == io.EOF {
-				return img, nil
+				return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, fmt.Errorf("unexpected EOF after %d pixels: expected %d", numDecodedPixels, numPixels)
 			}
 			if err != nil {
-				return nil, err
+				return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, err
 			}
 
 			switch {
 			case b1 == qoi_RGB:
 				_, err = io.ReadFull(b, px[:3])
 				if err != nil {
-					return nil, err
+					return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, err
 				}
 			case b1 == qoi_RGBA:
 				_, err = io.ReadFull(b, px[:])
 				if err != nil {
-					return nil, err
+					return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, err
 				}
 			case b1&qoi_MASK_2 == qoi_INDEX:
 				px = index[b1]
@@ -89,9 +99,9 @@ func Decode(r io.Reader) (image.Image, error) {
 				px[1] += ((b1 >> 2) & 0x03) - 2
 				px[2] += (b1 & 0x03) - 2
 			case b1&qoi_MASK_2 == qoi_LUMA:
-				b2, err := b.ReadByte()
+				b2, err = b.ReadByte()
 				if err != nil {
-					return nil, err
+					return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, err
 				}
 				vg := (b1 & 0b00111111) - 32
 				px[0] += vg - 8 + ((b2 >> 4) & 0x0f)
@@ -103,47 +113,49 @@ func Decode(r io.Reader) (image.Image, error) {
 				px = pixel{255, 0, 255, 255} // should not happen
 			}
 
-			index[int(qoi_COLOR_HASH(px[0], px[1], px[2], px[3]))%len(index)] = px
+			index[int(qoi_COLOR_HASH(px[0], px[1], px[2], px[3]))&0b111111] = px
 		}
+		numDecodedPixels++
 
-		// TODO stride ..
-		copy(pixels[:4], px[:])
-		pixels = pixels[4:] // advance
+		copy(dest[:bytesPerPixel], px[:bytesPerPixel])
+		dest = dest[bytesPerPixel:]
 	}
-	return img, nil
+	return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, nil
 }
 
-func Encode(w io.Writer, m image.Image) error {
-
+// Encode writes QOI image data to w, expecting line-wise RGB(A) data in src with a total of either width*height*3 (without alpha) or width*height*4 (with alpha) bytes.
+func Encode(w io.Writer, src []byte, width, height int) error {
 	var out = bufio.NewWriter(w)
 
-	minX := m.Bounds().Min.X
-	maxX := m.Bounds().Max.X
-	minY := m.Bounds().Min.Y
-	maxY := m.Bounds().Max.Y
-
-	NBPixels := (maxX - minX) * (maxY - minY)
-	if NBPixels == 0 || NBPixels >= qoiPixelsMax {
-		return errors.New("Bad image Size")
+	numPixels := width * height
+	if numPixels == 0 {
+		return errors.New("bad image size 0")
+	} else if numPixels >= qoiPixelsMax {
+		return fmt.Errorf("image must have less than %d pixels total", qoiPixelsMax)
 	}
+	bytesPerPixel := uint8(len(src) / (width * height))
+	if width*height*int(bytesPerPixel) != len(src) || (bytesPerPixel != 3 && bytesPerPixel != 4) {
+		return fmt.Errorf("len(src) / (width * height) is neither 3 nor 4")
+	}
+	hasAlpha := bytesPerPixel == 4
 
 	// write header to output
 	if err := binary.Write(out, binary.BigEndian, []byte(qoiMagic)); err != nil {
 		return err
 	}
 	// width
-	if err := binary.Write(out, binary.BigEndian, uint32(maxX-minX)); err != nil {
+	if err := binary.Write(out, binary.BigEndian, uint32(width)); err != nil {
 		return err
 	}
 	// height
-	if err := binary.Write(out, binary.BigEndian, uint32(maxY-minY)); err != nil {
+	if err := binary.Write(out, binary.BigEndian, uint32(height)); err != nil {
 		return err
 	}
 	// channels
-	if err := binary.Write(out, binary.BigEndian, uint8(4)); err != nil {
+	if err := binary.Write(out, binary.BigEndian, bytesPerPixel); err != nil {
 		return err
 	}
-	// 0b0000rgba colorspace
+	// sRGB with linear alpha
 	if err := binary.Write(out, binary.BigEndian, uint8(0)); err != nil {
 		return err
 	}
@@ -152,16 +164,21 @@ func Encode(w io.Writer, m image.Image) error {
 	px_prev := pixel{0, 0, 0, 255}
 	run := 0
 
-	for y := minY; y < maxY; y++ {
-		for x := minX; x < maxX; x++ {
-			// extract pixel and convert to non-premultiplied
-			c := color.NRGBAModel.Convert(m.At(x, y))
-			c_r, c_g, c_b, c_a := c.RGBA()
-			px := pixel{byte(c_r >> 8), byte(c_g >> 8), byte(c_b >> 8), byte(c_a >> 8)}
+	widthMinusOne := width - 1
+	heightMinusOne := height - 1
+
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			var px pixel
+			if hasAlpha {
+				px = pixel{src[(y*width+x)*int(bytesPerPixel)], src[(y*width+x)*int(bytesPerPixel)+1], src[(y*width+x)*int(bytesPerPixel)+2], src[(y*width+x)*int(bytesPerPixel)+3]}
+			} else {
+				px = pixel{src[(y*width+x)*int(bytesPerPixel)], src[(y*width+x)*int(bytesPerPixel)+1], src[(y*width+x)*int(bytesPerPixel)+2], 255}
+			}
 
 			if px == px_prev {
 				run++
-				last_pixel := x == (maxX-1) && y == (maxY-1)
+				last_pixel := x == widthMinusOne && y == heightMinusOne
 				if run == 62 || last_pixel {
 					out.WriteByte(qoi_RUN | byte(run-1))
 					run = 0
@@ -171,7 +188,7 @@ func Encode(w io.Writer, m image.Image) error {
 					out.WriteByte(qoi_RUN | byte(run-1))
 					run = 0
 				}
-				var index_pos byte = qoi_COLOR_HASH(px[0], px[1], px[2], px[3]) % 64
+				var index_pos byte = qoi_COLOR_HASH(px[0], px[1], px[2], px[3]) & 0b111111
 				if index[index_pos] == px {
 					out.WriteByte(qoi_INDEX | index_pos)
 				} else {
@@ -216,23 +233,36 @@ func Encode(w io.Writer, m image.Image) error {
 	return out.Flush()
 }
 
-func DecodeConfig(r io.Reader) (cfg image.Config, err error) {
-	var header [4 + 4 + 4 + 1 + 1]byte
-	if _, err = io.ReadAtLeast(r, header[:], len(header)); err != nil {
-		return
+// DecodeHeader decodes only the header from the beginning of a QOI image and returns it, if it is valid.
+func DecodeHeader(r io.Reader) (header Header, err error) {
+	err = binary.Read(r, binary.BigEndian, &header.magic)
+	if err != nil {
+		return Header{}, fmt.Errorf("could not read header magic: %w", err)
 	}
-
-	if string(header[:4]) != qoiMagic {
-		return cfg, errors.New("Invalid magic")
+	err = binary.Read(r, binary.BigEndian, &header.width)
+	if err != nil {
+		return Header{}, fmt.Errorf("could not read width: %w", err)
 	}
-	// only decodes as NRGBA images
-	return image.Config{
-		Width:      int(binary.BigEndian.Uint32(header[4:])),
-		Height:     int(binary.BigEndian.Uint32(header[8:])),
-		ColorModel: color.NRGBAModel,
-	}, err
-}
-
-func init() {
-	image.RegisterFormat("qoi", qoiMagic, Decode, DecodeConfig)
+	err = binary.Read(r, binary.BigEndian, &header.height)
+	if err != nil {
+		return Header{}, fmt.Errorf("could not read height: %w", err)
+	}
+	err = binary.Read(r, binary.BigEndian, &header.channels)
+	if err != nil {
+		return Header{}, fmt.Errorf("could not read channels: %w", err)
+	}
+	err = binary.Read(r, binary.BigEndian, &header.colorspace)
+	if err != nil {
+		return Header{}, fmt.Errorf("could not read colorspace: %w", err)
+	}
+	if string(header.magic[:4]) != qoiMagic {
+		return Header{}, fmt.Errorf("bad magic")
+	}
+	if header.channels < 3 || header.channels > 4 {
+		return Header{}, fmt.Errorf("invalid amount of channels %d: must be 3 or 4", header.channels)
+	}
+	if header.colorspace != 0 && header.colorspace != 1 {
+		return Header{}, fmt.Errorf("invalid colorspace %d: must be 0 (sRGB) or 1 (linear RGB)", header.colorspace)
+	}
+	return header, nil
 }

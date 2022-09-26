@@ -1,3 +1,3 @@
-module github.com/xfmoulet/qoi
+module github.com/Zyl9393/qoi
 
 go 1.17

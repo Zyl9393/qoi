@@ -1,17 +1,11 @@
-# QOI - The “Quite OK Image” format for fast, lossless image compression - in Go 
+# QOI - The “Quite OK Image” format for fast, lossless image compression - in Go
 
-Package and small utilities in pure Go, quite OK implementation
+Fork of github.com/xfmoulet/qoi where `image.Image` has been replaced with `[]byte` to allow the caller to reuse memory regions for better speeds when loading many images in succession (in my case, specifically with the intent to serve the data to OpenGL). The version in this repository will also omit the alpha channel if it is not present or not used (non-255 values) when decoding QOI image data as well as write the correct channel count when encoding.
 
-See [qoi.h](https://github.com/phoboslab/qoi/blob/master/qoi.h) for
-the documentation.
+See [qoi.h](https://github.com/phoboslab/qoi/blob/master/qoi.h) for the documentation.
 
 More info at https://qoiformat.org/ 
 
-## Performance
+## Tests?
 
-Performance is currently around half C version (optimized at `-O3`)
-
-## Example Usage
-
-- `cmd/qoiconv` converts between png <> qoi
-- `cmd/qoibench` bench the en/decoding vs. golang png implementation
+Feel free to add.
