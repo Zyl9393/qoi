@@ -11,7 +11,7 @@ import (
 	testdataloader "github.com/peteole/testdata-loader"
 )
 
-func TestImage(t *testing.T) {
+func TestDecode(t *testing.T) {
 	pngContent := testdataloader.GetTestFile("testdata/cyberpanel1.png")
 	img, err := png.Decode(bytes.NewReader(pngContent))
 	if err != nil {
@@ -23,6 +23,28 @@ func TestImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	decodeImg, _, err := image.Decode(qoiEncode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = imageEquals(decodeImg, img)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDecodeWithBuffer(t *testing.T) {
+	pngContent := testdataloader.GetTestFile("testdata/cyberpanel1.png")
+	img, err := png.Decode(bytes.NewReader(pngContent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	qoiEncode := bytes.NewBuffer(nil)
+	err = qoi.Encode(qoiEncode, img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bigBuf := make([]byte, 1024*1024*4)
+	decodeImg, err := qoi.DecodeIntoBuffer(qoiEncode, bigBuf)
 	if err != nil {
 		t.Fatal(err)
 	}
