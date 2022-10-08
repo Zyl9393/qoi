@@ -1,8 +1,11 @@
 # QOI - The “Quite OK Image” format for fast, lossless image compression - in Go
 
-Fork of github.com/xfmoulet/qoi where `image.Image` has been replaced with `[]byte` to allow the caller to reuse memory regions for better speeds when loading many images in succession (in my case, specifically with the intent to serve the data to OpenGL). The version in this repository will also omit the alpha channel if it is not present or not used (non-255 values) when decoding QOI image data as well as write the correct channel count when encoding.
+Fork of [xfmoulet/qoi](https://github.com/xfmoulet/qoi) with changes to allow buffer reuse. See `qoi.DecodeIntoBuffer()`. The version in this repository will also:
+* omit the alpha channel if it is not present when decoding.
+* omit the alpha channel if it is not present **or** not used (all alpha values =100%) when encoding.
+* write un-premultiplied instead of premultiplied values. (in accordance with QOI specification)
 
-See [qoi.h](https://github.com/phoboslab/qoi/blob/master/qoi.h) for the documentation.
+See [qoi.h](https://github.com/phoboslab/qoi/blob/master/qoi.h) for format specification.
 
 More info at https://qoiformat.org/ 
 

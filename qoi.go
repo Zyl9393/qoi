@@ -5,15 +5,21 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
 	"io"
 )
+
+func init() {
+	image.RegisterFormat("qoi", qoiMagic, decode, DecodeConfig)
+}
 
 type Header struct {
 	magic      [4]byte
 	width      uint32
 	height     uint32
 	channels   uint8
-	colorspace uint8
+	colorspace Colorspace
 }
 
 const (
@@ -39,58 +45,68 @@ func qoi_COLOR_HASH(r, g, b, a byte) byte {
 
 type pixel [4]byte
 
-// Decode decodes QOI image data from r into dest, until all pixels are written.
-// When a non-nil error is returned, bytesWritten will be equal to:
-//   width*height*3 if includesAlpha == false
-//   width*height*4 if includesAlpha == true
-// If dest cannot fit the image, an error is returned.
-//
-// QOI provides no information on whether the read color data is alpha-premultiplied. This information needs to be known by the caller.
-func Decode(reader io.Reader, dest []byte) (bytesWritten int, width uint32, height uint32, includesAlpha bool, err error) {
+func DecodeConfig(reader io.Reader) (cfg image.Config, err error) {
 	header, err := DecodeHeader(reader)
 	if err != nil {
-		return 0, 0, 0, false, fmt.Errorf("could not decode header: %w", err)
+		return cfg, err
 	}
-	numPixels := header.width * header.height
-	if numPixels == 0 {
-		return 0, 0, 0, false, nil
-	}
-	bytesPerPixel := header.channels
-	if numPixels > uint32(len(dest))/uint32(bytesPerPixel) {
-		return 0, 0, 0, false, fmt.Errorf("dest of size %d bytes cannot fit image data totalling %d bytes", len(dest), numPixels*uint32(bytesPerPixel))
-	}
+	return image.Config{ColorModel: color.NRGBAModel, Width: int(header.width), Height: int(header.height)}, nil
+}
 
-	b := bufio.NewReaderSize(reader, 250) // we make lots of small reads, so the cost of wrapping reader with a small buffered reader is worth it; don't use a big buffer though, since allocating memory is SLOW.
+func decode(r io.Reader) (image.Image, error) {
+	return Decode(r)
+}
+
+func Decode(reader io.Reader) (*Image, error) {
+	header, err := DecodeHeader(reader)
+	if err != nil {
+		return nil, err
+	}
+	pix := make([]uint8, header.width*header.height*uint32(header.channels))
+	img := &Image{
+		Pix:        pix,
+		Width:      int(header.width),
+		Height:     int(header.height),
+		Channels:   header.channels,
+		Colorspace: header.colorspace,
+	}
+	return img, decodeBody(reader, pix, int(img.Channels), img.Width*int(img.Channels))
+}
+
+func decodeBody(r io.Reader, dest []uint8, bytesPerPixel int, stride int) (err error) {
+	in := bufio.NewReaderSize(r, 250)
+	numPixels := len(dest)
+
 	var b1, b2 byte
 
 	var index [64]pixel
 
 	run := 0
-	numDecodedPixels := uint32(0)
+	numDecodedPixels := 0
 
 	px := pixel{0, 0, 0, 255}
 	for numDecodedPixels < numPixels {
 		if run > 0 {
 			run--
 		} else {
-			b1, err = b.ReadByte()
+			b1, err = in.ReadByte()
 			if err == io.EOF {
-				return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, fmt.Errorf("unexpected EOF after %d pixels: expected %d", numDecodedPixels, numPixels)
+				return fmt.Errorf("unexpected EOF after %d pixels: expected %d", numDecodedPixels, numPixels)
 			}
 			if err != nil {
-				return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, err
+				return err
 			}
 
 			switch {
 			case b1 == qoi_RGB:
-				_, err = io.ReadFull(b, px[:3])
+				_, err = io.ReadFull(in, px[:3])
 				if err != nil {
-					return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, err
+					return err
 				}
 			case b1 == qoi_RGBA:
-				_, err = io.ReadFull(b, px[:])
+				_, err = io.ReadFull(in, px[:])
 				if err != nil {
-					return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, err
+					return err
 				}
 			case b1&qoi_MASK_2 == qoi_INDEX:
 				px = index[b1]
@@ -99,9 +115,9 @@ func Decode(reader io.Reader, dest []byte) (bytesWritten int, width uint32, heig
 				px[1] += ((b1 >> 2) & 0x03) - 2
 				px[2] += (b1 & 0x03) - 2
 			case b1&qoi_MASK_2 == qoi_LUMA:
-				b2, err = b.ReadByte()
+				b2, err = in.ReadByte()
 				if err != nil {
-					return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, err
+					return err
 				}
 				vg := (b1 & 0b00111111) - 32
 				px[0] += vg - 8 + ((b2 >> 4) & 0x0f)
@@ -115,17 +131,49 @@ func Decode(reader io.Reader, dest []byte) (bytesWritten int, width uint32, heig
 
 			index[int(qoi_COLOR_HASH(px[0], px[1], px[2], px[3]))&0b111111] = px
 		}
-		numDecodedPixels++
 
 		copy(dest[:bytesPerPixel], px[:bytesPerPixel])
 		dest = dest[bytesPerPixel:]
+		numDecodedPixels++
 	}
-	return int(numDecodedPixels * uint32(bytesPerPixel)), header.width, header.height, header.channels == 4, nil
+	return nil
 }
 
-// Encode writes QOI image data to w, expecting line-wise RGB(A) data in src with a total of either width*height*3 (without alpha) or width*height*4 (with alpha) bytes.
-func Encode(w io.Writer, src []byte, width, height int) error {
-	var out = bufio.NewWriter(w)
+// Decode decodes QOI image data from r into dest, until all pixels are written.
+// If dest cannot fit the image, an error is returned.
+func DecodeIntoBuffer(r io.Reader, dest []byte) (*Image, error) {
+	header, err := DecodeHeader(r)
+	if err != nil {
+		return nil, fmt.Errorf("could not decode header: %w", err)
+	}
+	numPixels := int(header.width * header.height)
+	if numPixels == 0 {
+		return nil, nil
+	}
+	bytesPerPixel := int(header.channels)
+	if numPixels*bytesPerPixel > len(dest) {
+		return nil, fmt.Errorf("dest of size %d bytes cannot fit image data totalling %d bytes", len(dest), numPixels*bytesPerPixel)
+	}
+	img := &Image{
+		Pix:        dest[:numPixels],
+		Width:      int(header.width),
+		Height:     int(header.height),
+		Channels:   header.channels,
+		Colorspace: header.colorspace,
+	}
+	return img, decodeBody(r, dest, int(img.Channels), img.Width*int(img.Channels))
+}
+
+// Encode encodes img as a QOI file and writes it to w.
+func Encode(w io.Writer, img image.Image) error {
+	out := bufio.NewWriter(w)
+
+	minX := img.Bounds().Min.X
+	maxX := img.Bounds().Max.X
+	minY := img.Bounds().Min.Y
+	maxY := img.Bounds().Max.Y
+	width := maxX - minX
+	height := maxY - minY
 
 	numPixels := width * height
 	if numPixels == 0 {
@@ -133,11 +181,10 @@ func Encode(w io.Writer, src []byte, width, height int) error {
 	} else if numPixels >= qoiPixelsMax {
 		return fmt.Errorf("image must have less than %d pixels total", qoiPixelsMax)
 	}
-	bytesPerPixel := uint8(len(src) / (width * height))
-	if width*height*int(bytesPerPixel) != len(src) || (bytesPerPixel != 3 && bytesPerPixel != 4) {
-		return fmt.Errorf("len(src) / (width * height) is neither 3 nor 4")
+	bytesPerPixel := 3
+	if !isOpaqueImage(img) {
+		bytesPerPixel++
 	}
-	hasAlpha := bytesPerPixel == 4
 
 	// write header to output
 	if err := binary.Write(out, binary.BigEndian, []byte(qoiMagic)); err != nil {
@@ -166,15 +213,12 @@ func Encode(w io.Writer, src []byte, width, height int) error {
 
 	widthMinusOne := width - 1
 	heightMinusOne := height - 1
+	var px pixel
 
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			var px pixel
-			if hasAlpha {
-				px = pixel{src[(y*width+x)*int(bytesPerPixel)], src[(y*width+x)*int(bytesPerPixel)+1], src[(y*width+x)*int(bytesPerPixel)+2], src[(y*width+x)*int(bytesPerPixel)+3]}
-			} else {
-				px = pixel{src[(y*width+x)*int(bytesPerPixel)], src[(y*width+x)*int(bytesPerPixel)+1], src[(y*width+x)*int(bytesPerPixel)+2], 255}
-			}
+	for y := minY; y < maxY; y++ {
+		for x := minX; x < maxX; x++ {
+			c := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+			px = pixel{c.R, c.G, c.B, c.A}
 
 			if px == px_prev {
 				run++
@@ -261,7 +305,7 @@ func DecodeHeader(r io.Reader) (header Header, err error) {
 	if header.channels < 3 || header.channels > 4 {
 		return Header{}, fmt.Errorf("invalid amount of channels %d: must be 3 or 4", header.channels)
 	}
-	if header.colorspace != 0 && header.colorspace != 1 {
+	if header.colorspace != SRGB && header.colorspace != Linear {
 		return Header{}, fmt.Errorf("invalid colorspace %d: must be 0 (sRGB) or 1 (linear RGB)", header.colorspace)
 	}
 	return header, nil
