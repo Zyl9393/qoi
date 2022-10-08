@@ -8,7 +8,3 @@ Fork of [xfmoulet/qoi](https://github.com/xfmoulet/qoi) with changes to allow bu
 See [qoi.h](https://github.com/phoboslab/qoi/blob/master/qoi.h) for format specification.
 
 More info at https://qoiformat.org/ 
-
-## Tests?
-
-Feel free to add.

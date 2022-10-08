@@ -75,7 +75,7 @@ func Decode(reader io.Reader) (*Image, error) {
 
 func decodeBody(r io.Reader, dest []uint8, bytesPerPixel int, stride int) (err error) {
 	in := bufio.NewReaderSize(r, 250)
-	numPixels := len(dest)
+	numPixels := len(dest) / bytesPerPixel
 
 	var b1, b2 byte
 
