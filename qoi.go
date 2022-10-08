@@ -155,13 +155,13 @@ func DecodeIntoBuffer(r io.Reader, dest []byte) (*Image, error) {
 		return nil, fmt.Errorf("dest of size %d bytes cannot fit image data totalling %d bytes", len(dest), numPixels*bytesPerPixel)
 	}
 	img := &Image{
-		Pix:        dest[:numPixels],
+		Pix:        dest[:numPixels*bytesPerPixel],
 		Width:      int(header.width),
 		Height:     int(header.height),
 		Channels:   header.channels,
 		Colorspace: header.colorspace,
 	}
-	return img, decodeBody(r, dest, int(img.Channels), img.Width*int(img.Channels))
+	return img, decodeBody(r, img.Pix, int(img.Channels), img.Width*int(img.Channels))
 }
 
 // Encode encodes img as a QOI file and writes it to w.
