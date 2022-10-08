@@ -199,7 +199,7 @@ func Encode(w io.Writer, img image.Image) error {
 		return err
 	}
 	// channels
-	if err := binary.Write(out, binary.BigEndian, bytesPerPixel); err != nil {
+	if err := binary.Write(out, binary.BigEndian, uint8(bytesPerPixel)); err != nil {
 		return err
 	}
 	// sRGB with linear alpha
